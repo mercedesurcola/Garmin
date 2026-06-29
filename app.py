@@ -19,8 +19,22 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Secret"
+    return response
+
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def handle_options(path):
+    return jsonify({}), 200
+
+
 # Clave secreta para que solo Ferozo pueda llamar a este servicio
-API_SECRET = os.environ.get("IZ3PiDLoetirkdwRSDd5OcRe", "cambiar-esta-clave-en-produccion")
+API_SECRET = os.environ.get("API_SECRET", "cambiar-esta-clave-en-produccion")
 
 # Directorio donde se guardan los tokens por alumno
 TOKENS_DIR = os.environ.get("TOKENS_DIR", "/tmp/garmin_tokens")
