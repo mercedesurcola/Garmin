@@ -1,0 +1,335 @@
+"""
+CUSOL — Garmin Microservice
+Recibe entrenamientos desde el módulo PT y los sube a Garmin Connect.
+
+Endpoints:
+  POST /auth          → primer login (email + password + mfa opcional)
+  POST /send-workout  → subir y programar un entrenamiento
+  GET  /health        → verificar que el servicio está vivo
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify
+from garminconnect import Garmin, GarminConnectAuthenticationError
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Clave secreta para que solo Ferozo pueda llamar a este servicio
+API_SECRET = os.environ.get("IZ3PiDLoetirkdwRSDd5OcRe", "cambiar-esta-clave-en-produccion")
+
+# Directorio donde se guardan los tokens por alumno
+TOKENS_DIR = os.environ.get("TOKENS_DIR", "/tmp/garmin_tokens")
+os.makedirs(TOKENS_DIR, exist_ok=True)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def check_secret(req):
+    """Verifica que la request viene de Ferozo."""
+    secret = req.headers.get("X-API-Secret") or req.json.get("api_secret", "")
+    return secret == API_SECRET
+
+
+def token_path(alumno_id: str) -> str:
+    """Ruta del archivo de tokens de un alumno."""
+    safe_id = "".join(c for c in str(alumno_id) if c.isalnum() or c == "_")
+    return os.path.join(TOKENS_DIR, f"alumno_{safe_id}")
+
+
+def get_client(alumno_id: str, email: str = None, password: str = None) -> Garmin:
+    """
+    Devuelve un cliente Garmin autenticado.
+    Si hay tokens guardados los usa; si no, hace login con credenciales.
+    """
+    path = token_path(alumno_id)
+    client = Garmin(email=email, password=password)
+
+    if os.path.exists(path):
+        try:
+            client.login(path)
+            logger.info("Tokens cargados para alumno %s", alumno_id)
+            return client
+        except Exception as e:
+            logger.warning("Tokens inválidos para alumno %s: %s", alumno_id, e)
+
+    # Sin tokens válidos: necesita credenciales
+    if not email or not password:
+        raise ValueError("Se requieren credenciales para el primer login")
+
+    client.login()
+    client.garth.dump(path)
+    logger.info("Login exitoso y tokens guardados para alumno %s", alumno_id)
+    return client
+
+
+def build_workout_json(entrenamiento: dict) -> dict:
+    """
+    Convierte el formato de rutina del módulo PT al formato JSON de Garmin.
+
+    Formato de entrada (desde personaltrainer.html):
+    {
+      "nombre": "Rutina Fuerza A",
+      "ejercicios": [
+        {
+          "nombre": "Sentadilla",
+          "series": 4,
+          "repeticiones": "8-10",
+          "peso": "80kg",
+          "descanso": 90
+        },
+        ...
+      ]
+    }
+    """
+    steps = []
+
+    for i, ej in enumerate(entrenamiento.get("ejercicios", [])):
+        nombre   = ej.get("nombre", f"Ejercicio {i+1}")
+        series   = int(ej.get("series", 3))
+        reps     = str(ej.get("repeticiones", "10"))
+        peso     = str(ej.get("peso", ""))
+        descanso = int(ej.get("descanso", 60))
+
+        # Descripción del paso
+        desc_parts = [f"{series} series x {reps} reps"]
+        if peso:
+            desc_parts.append(f"@ {peso}")
+        desc = " ".join(desc_parts)
+
+        # Paso de ejercicio
+        steps.append({
+            "type": "ExecutableStepDTO",
+            "stepOrder": len(steps) + 1,
+            "stepType": {
+                "stepTypeId": 3,       # INTERVAL
+                "stepTypeKey": "interval"
+            },
+            "childStepId": None,
+            "description": desc,
+            "exerciseName": nombre,
+            "targetType": {
+                "workoutTargetTypeId": 1,
+                "workoutTargetTypeKey": "no.target"
+            },
+            "numberOfIterations": series,
+            "endCondition": {
+                "conditionTypeId": 3,
+                "conditionTypeKey": "reps.condition",
+                "conditionValue": reps
+            },
+            "endConditionValue": None,
+            "preferredEndConditionUnit": None
+        })
+
+        # Paso de descanso (si hay)
+        if descanso > 0 and i < len(entrenamiento.get("ejercicios", [])) - 1:
+            steps.append({
+                "type": "ExecutableStepDTO",
+                "stepOrder": len(steps) + 1,
+                "stepType": {
+                    "stepTypeId": 4,
+                    "stepTypeKey": "recovery"
+                },
+                "childStepId": None,
+                "description": f"Descanso {descanso}s",
+                "endCondition": {
+                    "conditionTypeId": 2,
+                    "conditionTypeKey": "time.condition",
+                    "conditionValue": descanso
+                },
+                "endConditionValue": descanso,
+                "targetType": {
+                    "workoutTargetTypeId": 1,
+                    "workoutTargetTypeKey": "no.target"
+                }
+            })
+
+    return {
+        "workoutName": entrenamiento.get("nombre", "Entrenamiento"),
+        "description": entrenamiento.get("descripcion", ""),
+        "sportType": {
+            "sportTypeId": 5,
+            "sportTypeKey": "strength_training"
+        },
+        "workoutSegments": [
+            {
+                "segmentOrder": 1,
+                "sportType": {
+                    "sportTypeId": 5,
+                    "sportTypeKey": "strength_training"
+                },
+                "workoutSteps": steps
+            }
+        ]
+    }
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "cusol-garmin", "ts": datetime.utcnow().isoformat()})
+
+
+@app.route("/auth", methods=["POST"])
+def auth():
+    """
+    Primer login del alumno con sus credenciales de Garmin.
+    Si tiene 2FA, Garmin envía el código y hay que llamar a este endpoint
+    con el campo 'mfa_code' en una segunda request.
+
+    Body: {
+      "api_secret": "...",
+      "alumno_id": 42,
+      "email": "alumno@mail.com",
+      "password": "su-password",
+      "mfa_code": "123456"   ← opcional, solo si tiene 2FA
+    }
+    """
+    if not check_secret(request):
+        return jsonify({"error": "No autorizado"}), 401
+
+    data       = request.json or {}
+    alumno_id  = data.get("alumno_id")
+    email      = data.get("email")
+    password   = data.get("password")
+    mfa_code   = data.get("mfa_code")  # Solo si tiene 2FA
+
+    if not alumno_id or not email or not password:
+        return jsonify({"error": "Faltan campos: alumno_id, email, password"}), 400
+
+    try:
+        path   = token_path(alumno_id)
+
+        if mfa_code:
+            # Segunda llamada: completar 2FA
+            client = Garmin(email=email, password=password,
+                            prompt_mfa=lambda: mfa_code)
+        else:
+            # Sin 2FA
+            client = Garmin(email=email, password=password)
+
+        client.login()
+        client.garth.dump(path)
+
+        return jsonify({
+            "ok": True,
+            "mensaje": "Garmin conectado correctamente",
+            "alumno_id": alumno_id
+        })
+
+    except GarminConnectAuthenticationError as e:
+        msg = str(e)
+        # Garmin pidió MFA pero no lo recibimos
+        if "MFA" in msg.upper() or "2FA" in msg.upper() or "verification" in msg.lower():
+            return jsonify({
+                "ok": False,
+                "requiere_mfa": True,
+                "mensaje": "Garmin requiere código de verificación. Revisá tu email o app de autenticación."
+            }), 200
+        return jsonify({"error": f"Credenciales inválidas: {msg}"}), 401
+
+    except Exception as e:
+        logger.exception("Error en /auth para alumno %s", alumno_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/send-workout", methods=["POST"])
+def send_workout():
+    """
+    Sube el entrenamiento a Garmin Connect y lo programa en la fecha indicada.
+
+    Body: {
+      "api_secret": "...",
+      "alumno_id": 42,
+      "fecha": "2026-06-28",
+      "entrenamiento": {
+        "nombre": "Rutina Fuerza A",
+        "descripcion": "...",
+        "ejercicios": [ ... ]
+      }
+    }
+    """
+    if not check_secret(request):
+        return jsonify({"error": "No autorizado"}), 401
+
+    data          = request.json or {}
+    alumno_id     = data.get("alumno_id")
+    fecha         = data.get("fecha")
+    entrenamiento = data.get("entrenamiento")
+
+    if not alumno_id or not fecha or not entrenamiento:
+        return jsonify({"error": "Faltan campos: alumno_id, fecha, entrenamiento"}), 400
+
+    # Validar formato de fecha
+    try:
+        datetime.strptime(fecha, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "Formato de fecha inválido. Usar YYYY-MM-DD"}), 400
+
+    path = token_path(alumno_id)
+    if not os.path.exists(path):
+        return jsonify({
+            "error": "Este alumno no tiene Garmin conectado",
+            "requiere_auth": True
+        }), 401
+
+    try:
+        client = get_client(alumno_id)
+
+        # 1. Construir el JSON del workout
+        workout_json = build_workout_json(entrenamiento)
+        logger.info("Subiendo workout '%s' para alumno %s", entrenamiento.get("nombre"), alumno_id)
+
+        # 2. Subir el workout a Garmin Connect
+        resultado = client.upload_workout(workout_json)
+        workout_id = resultado.get("detailId") or resultado.get("workoutId")
+
+        if not workout_id:
+            logger.error("Respuesta inesperada de Garmin: %s", resultado)
+            return jsonify({"error": "Garmin no devolvió un ID de workout", "detalle": resultado}), 500
+
+        # 3. Programarlo en el calendario del alumno
+        client.schedule_workout(workout_id, fecha)
+        logger.info("Workout %s programado para %s (alumno %s)", workout_id, fecha, alumno_id)
+
+        return jsonify({
+            "ok": True,
+            "workout_id": workout_id,
+            "fecha": fecha,
+            "mensaje": f"Entrenamiento enviado a Garmin para el {fecha}"
+        })
+
+    except Exception as e:
+        logger.exception("Error en /send-workout para alumno %s", alumno_id)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    """Elimina los tokens de un alumno (desconectar Garmin)."""
+    if not check_secret(request):
+        return jsonify({"error": "No autorizado"}), 401
+
+    data      = request.json or {}
+    alumno_id = data.get("alumno_id")
+
+    if not alumno_id:
+        return jsonify({"error": "Falta alumno_id"}), 400
+
+    path = token_path(alumno_id)
+    if os.path.exists(path):
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+
+    return jsonify({"ok": True, "mensaje": "Garmin desconectado"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
