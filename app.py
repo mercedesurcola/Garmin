@@ -50,9 +50,11 @@ def check_secret(req):
 
 
 def token_path(alumno_id: str) -> str:
-    """Ruta del archivo de tokens de un alumno."""
-    safe_id = "".join(c for c in str(alumno_id) if c.isalnum() or c == "_")
-    return os.path.join(TOKENS_DIR, f"alumno_{safe_id}")
+    """Ruta del archivo de tokens de un alumno (acepta ID numérico o email)."""
+    import hashlib
+    safe_id = "".join(c for c in str(alumno_id) if c.isalnum() or c == "_")[:40]
+    hash_suffix = hashlib.md5(str(alumno_id).encode()).hexdigest()[:8]
+    return os.path.join(TOKENS_DIR, f"alumno_{safe_id}_{hash_suffix}")
 
 
 def get_client(alumno_id: str, email: str = None, password: str = None) -> Garmin:
@@ -82,148 +84,217 @@ def get_client(alumno_id: str, email: str = None, password: str = None) -> Garmi
     return client
 
 
+def _build_step_fuerza(ej: dict, step_order_start: int) -> tuple[dict, int]:
+    """Arma un RepeatGroup de fuerza (series x reps x descanso). Devuelve (step, siguiente_step_order)."""
+    step_order = step_order_start
+    nombre   = ej.get("nombre", "Ejercicio")
+    series   = int(ej.get("series", 3))
+    reps     = ej.get("repeticiones", "10")
+    peso     = str(ej.get("peso", ""))
+    descanso = int(ej.get("descanso", 60))
+
+    try:
+        reps_num = int(str(reps).split("-")[0].strip())
+    except (ValueError, IndexError):
+        reps_num = 10
+
+    desc_parts = [f"{series}x{reps}"]
+    if peso:
+        desc_parts.append(f"@ {peso}")
+    desc = " ".join(desc_parts)
+
+    exercise_step = {
+        "type": "ExecutableStepDTO",
+        "stepOrder": step_order,
+        "stepType": {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
+        "endCondition": {"conditionTypeId": 10, "conditionTypeKey": "reps", "displayOrder": 10, "displayable": True},
+        "endConditionValue": reps_num,
+        "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1},
+        "description": desc
+    }
+    step_order += 1
+    repeat_steps = [exercise_step]
+
+    if descanso > 0:
+        recovery_step = {
+            "type": "ExecutableStepDTO",
+            "stepOrder": step_order,
+            "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery", "displayOrder": 4},
+            "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True},
+            "endConditionValue": descanso,
+            "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1}
+        }
+        repeat_steps.append(recovery_step)
+        step_order += 1
+
+    repeat_group = {
+        "type": "RepeatGroupDTO",
+        "stepOrder": step_order,
+        "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
+        "numberOfIterations": series,
+        "workoutSteps": repeat_steps,
+        "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations", "displayOrder": 7, "displayable": False},
+        "endConditionValue": float(series),
+        "smartRepeat": False
+    }
+    step_order += 1
+    return repeat_group, step_order
+
+
+# Zona de esfuerzo (1=suave..4=máximo, del PT) → zona de FC de Garmin (1-5).
+# Dejamos un margen: suave→Z2, medio→Z3, rápido→Z4, máximo→Z5.
+ZONA_PT_A_GARMIN = {1: 2, 2: 3, 3: 4, 4: 5}
+
+# stepType según el bloque de running elegido en el PT
+RUN_BLOQUE_STEP_TYPE = {
+    "calentamiento": {"stepTypeId": 1, "stepTypeKey": "warmup",  "displayOrder": 1},
+    "trabajo":        {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
+    "descanso":       {"stepTypeId": 4, "stepTypeKey": "recovery", "displayOrder": 4},
+    "vuelta_calma":   {"stepTypeId": 2, "stepTypeKey": "cooldown", "displayOrder": 2},
+}
+
+
+def _build_step_running(paso: dict, step_order_start: int) -> tuple[dict, int]:
+    """
+    Arma un step (o RepeatGroup si se repite) de running, por tiempo o distancia,
+    con zona de FC opcional. Devuelve (step, siguiente_step_order).
+    """
+    step_order  = step_order_start
+    nombre      = paso.get("run_nombre", "Tramo")
+    bloque      = paso.get("run_bloque", "trabajo")
+    modo        = paso.get("run_modo", "tiempo")          # 'tiempo' | 'distancia'
+    valor       = float(paso.get("run_valor", 60))        # segundos si tiempo, metros si distancia
+    zona_pt     = paso.get("run_zona_fc")                 # 1-4 (escala del PT) o None
+    repeticiones= int(paso.get("run_repeticiones", 1) or 1)
+    descanso    = int(paso.get("run_descanso_seg") or 0)
+
+    step_type = RUN_BLOQUE_STEP_TYPE.get(bloque, RUN_BLOQUE_STEP_TYPE["trabajo"])
+
+    if modo == "distancia":
+        end_condition = {"conditionTypeId": 3, "conditionTypeKey": "distance", "displayOrder": 3, "displayable": True}
+        end_value = valor  # metros
+    else:
+        end_condition = {"conditionTypeId": 2, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True}
+        end_value = valor  # segundos
+
+    if zona_pt and int(zona_pt) in ZONA_PT_A_GARMIN:
+        target_type = {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 4}
+        zone_number = ZONA_PT_A_GARMIN[int(zona_pt)]
+    else:
+        target_type = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1}
+        zone_number = None
+
+    main_step = {
+        "type": "ExecutableStepDTO",
+        "stepOrder": step_order,
+        "stepType": step_type,
+        "endCondition": end_condition,
+        "endConditionValue": end_value,
+        "targetType": target_type,
+        "description": nombre
+    }
+    if zone_number:
+        main_step["zoneNumber"] = zone_number
+    step_order += 1
+
+    # Sin repeticiones múltiples: el step va suelto
+    if repeticiones <= 1:
+        return main_step, step_order
+
+    # Con repeticiones (ej: 4x200m): RepeatGroup con el tramo + descanso adentro
+    repeat_steps = [main_step]
+
+    if descanso > 0:
+        recovery_step = {
+            "type": "ExecutableStepDTO",
+            "stepOrder": step_order,
+            "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery", "displayOrder": 4},
+            "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time", "displayOrder": 2, "displayable": True},
+            "endConditionValue": descanso,
+            "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target", "displayOrder": 1}
+        }
+        repeat_steps.append(recovery_step)
+        step_order += 1
+
+    repeat_group = {
+        "type": "RepeatGroupDTO",
+        "stepOrder": step_order,
+        "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
+        "numberOfIterations": repeticiones,
+        "workoutSteps": repeat_steps,
+        "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations", "displayOrder": 7, "displayable": False},
+        "endConditionValue": float(repeticiones),
+        "smartRepeat": False
+    }
+    step_order += 1
+    return repeat_group, step_order
+
+
 def build_workout_json(entrenamiento: dict) -> dict:
     """
     Convierte el formato de rutina del módulo PT al formato JSON de Garmin Connect.
-    Cada ejercicio se arma como un RepeatGroup (series) que contiene un step de
-    ejercicio (terminado por repeticiones fijas) y un step de descanso (por tiempo).
+    Soporta dos formatos de entrada:
 
-    Formato de entrada (desde personaltrainer.html):
-    {
-      "nombre": "Rutina Fuerza A",
-      "ejercicios": [
-        {
-          "nombre": "Sentadilla",
-          "series": 4,
-          "repeticiones": "8-10",
-          "peso": "80kg",
-          "descanso": 90
-        },
-        ...
-      ]
-    }
+    1) Solo fuerza (legacy, sigue funcionando igual):
+       { "nombre": "...", "ejercicios": [ {nombre, series, repeticiones, peso, descanso}, ... ] }
+
+    2) Mixto fuerza + running (nuevo):
+       { "nombre": "...", "pasos": [
+           {"tipo_paso":"fuerza", "nombre", "series", "repeticiones", "peso", "descanso"},
+           {"tipo_paso":"running", "run_nombre", "run_bloque", "run_modo", "run_valor",
+            "run_zona_fc", "run_repeticiones", "run_descanso_seg"},
+           ...
+         ] }
+
+    El sportType del workout completo se decide por el primer paso de running
+    presente (running); si no hay ninguno, queda como strength_training.
     """
-    ejercicios = entrenamiento.get("ejercicios", [])
+    pasos = entrenamiento.get("pasos")
+    if pasos is None:
+        # Formato legacy: todo es fuerza
+        pasos = [{"tipo_paso": "fuerza", **ej} for ej in entrenamiento.get("ejercicios", [])]
+
+    hay_running = any(p.get("tipo_paso") == "running" for p in pasos)
+
     steps = []
     step_order = 1
+    duracion_estimada = 0
 
-    for i, ej in enumerate(ejercicios):
-        nombre   = ej.get("nombre", f"Ejercicio {i+1}")
-        series   = int(ej.get("series", 3))
-        reps     = ej.get("repeticiones", "10")
-        peso     = str(ej.get("peso", ""))
-        descanso = int(ej.get("descanso", 60))
+    for paso in pasos:
+        if paso.get("tipo_paso") == "running":
+            step, step_order = _build_step_running(paso, step_order)
+            steps.append(step)
+            valor = float(paso.get("run_valor", 60))
+            reps  = int(paso.get("run_repeticiones", 1) or 1)
+            if paso.get("run_modo") == "distancia":
+                # Estimación grosera: 6 min/km
+                duracion_estimada += int(valor / 1000 * 360) * reps
+            else:
+                duracion_estimada += int(valor) * reps
+            duracion_estimada += int(paso.get("run_descanso_seg") or 0) * max(reps - 1, 0)
+        else:
+            step, step_order = _build_step_fuerza(paso, step_order)
+            steps.append(step)
+            series   = int(paso.get("series", 3))
+            descanso = int(paso.get("descanso", 60))
+            duracion_estimada += series * (descanso + 5)
 
-        # "8-10" → tomamos el primer número como objetivo de reps
-        try:
-            reps_num = int(str(reps).split("-")[0].strip())
-        except (ValueError, IndexError):
-            reps_num = 10
-
-        desc_parts = [f"{series}x{reps}"]
-        if peso:
-            desc_parts.append(f"@ {peso}")
-        desc = " ".join(desc_parts)
-
-        # Step de ejercicio: termina por repeticiones fijas
-        exercise_step = {
-            "type": "ExecutableStepDTO",
-            "stepOrder": step_order,
-            "stepType": {
-                "stepTypeId": 3,
-                "stepTypeKey": "interval",
-                "displayOrder": 3
-            },
-            "endCondition": {
-                "conditionTypeId": 10,
-                "conditionTypeKey": "reps",
-                "displayOrder": 10,
-                "displayable": True
-            },
-            "endConditionValue": reps_num,
-            "targetType": {
-                "workoutTargetTypeId": 1,
-                "workoutTargetTypeKey": "no.target",
-                "displayOrder": 1
-            },
-            "description": desc
-        }
-        step_order += 1
-
-        repeat_steps = [exercise_step]
-
-        # Step de descanso (si hay)
-        if descanso > 0:
-            recovery_step = {
-                "type": "ExecutableStepDTO",
-                "stepOrder": step_order,
-                "stepType": {
-                    "stepTypeId": 4,
-                    "stepTypeKey": "recovery",
-                    "displayOrder": 4
-                },
-                "endCondition": {
-                    "conditionTypeId": 2,
-                    "conditionTypeKey": "time",
-                    "displayOrder": 2,
-                    "displayable": True
-                },
-                "endConditionValue": descanso,
-                "targetType": {
-                    "workoutTargetTypeId": 1,
-                    "workoutTargetTypeKey": "no.target",
-                    "displayOrder": 1
-                }
-            }
-            repeat_steps.append(recovery_step)
-            step_order += 1
-
-        # Repeat group: las series del ejercicio
-        repeat_group = {
-            "type": "RepeatGroupDTO",
-            "stepOrder": step_order,
-            "stepType": {
-                "stepTypeId": 6,
-                "stepTypeKey": "repeat",
-                "displayOrder": 6
-            },
-            "numberOfIterations": series,
-            "workoutSteps": repeat_steps,
-            "endCondition": {
-                "conditionTypeId": 7,
-                "conditionTypeKey": "iterations",
-                "displayOrder": 7,
-                "displayable": False
-            },
-            "endConditionValue": float(series),
-            "smartRepeat": False
-        }
-        steps.append(repeat_group)
-        step_order += 1
-
-    duracion_estimada = sum(
-        int(ej.get("series", 3)) * (int(ej.get("descanso", 60)) + 5)
-        for ej in ejercicios
-    ) or 600
+    sport_type = (
+        {"sportTypeId": 1, "sportTypeKey": "running", "displayOrder": 1}
+        if hay_running else
+        {"sportTypeId": 5, "sportTypeKey": "strength_training", "displayOrder": 1}
+    )
 
     return {
         "workoutName": entrenamiento.get("nombre", "Entrenamiento"),
         "description": entrenamiento.get("descripcion") or None,
-        "sportType": {
-            "sportTypeId": 5,
-            "sportTypeKey": "strength_training",
-            "displayOrder": 1
-        },
-        "estimatedDurationInSecs": duracion_estimada,
+        "sportType": sport_type,
+        "estimatedDurationInSecs": duracion_estimada or 600,
         "author": {},
         "workoutSegments": [
             {
                 "segmentOrder": 1,
-                "sportType": {
-                    "sportTypeId": 5,
-                    "sportTypeKey": "strength_training",
-                    "displayOrder": 1
-                },
+                "sportType": sport_type,
                 "workoutSteps": steps
             }
         ]
