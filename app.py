@@ -84,7 +84,9 @@ def get_client(alumno_id: str, email: str = None, password: str = None) -> Garmi
 
 def build_workout_json(entrenamiento: dict) -> dict:
     """
-    Convierte el formato de rutina del módulo PT al formato JSON de Garmin.
+    Convierte el formato de rutina del módulo PT al formato JSON de Garmin Connect.
+    Cada ejercicio se arma como un RepeatGroup (series) que contiene un step de
+    ejercicio (terminado por repeticiones fijas) y un step de descanso (por tiempo).
 
     Formato de entrada (desde personaltrainer.html):
     {
@@ -101,88 +103,131 @@ def build_workout_json(entrenamiento: dict) -> dict:
       ]
     }
     """
+    ejercicios = entrenamiento.get("ejercicios", [])
     steps = []
+    step_order = 1
 
-    for i, ej in enumerate(entrenamiento.get("ejercicios", [])):
+    for i, ej in enumerate(ejercicios):
         nombre   = ej.get("nombre", f"Ejercicio {i+1}")
         series   = int(ej.get("series", 3))
-        reps     = str(ej.get("repeticiones", "10"))
+        reps     = ej.get("repeticiones", "10")
         peso     = str(ej.get("peso", ""))
         descanso = int(ej.get("descanso", 60))
 
-        # Descripción del paso
-        desc_parts = [f"{series} series x {reps} reps"]
+        # "8-10" → tomamos el primer número como objetivo de reps
+        try:
+            reps_num = int(str(reps).split("-")[0].strip())
+        except (ValueError, IndexError):
+            reps_num = 10
+
+        desc_parts = [f"{series}x{reps}"]
         if peso:
             desc_parts.append(f"@ {peso}")
         desc = " ".join(desc_parts)
 
-        # Paso de ejercicio
-        steps.append({
+        # Step de ejercicio: termina por repeticiones fijas
+        exercise_step = {
             "type": "ExecutableStepDTO",
-            "stepOrder": len(steps) + 1,
+            "stepOrder": step_order,
             "stepType": {
-                "stepTypeId": 3,       # INTERVAL
-                "stepTypeKey": "interval"
+                "stepTypeId": 3,
+                "stepTypeKey": "interval",
+                "displayOrder": 3
             },
-            "childStepId": None,
-            "description": desc,
-            "exerciseName": nombre,
+            "endCondition": {
+                "conditionTypeId": 10,
+                "conditionTypeKey": "reps",
+                "displayOrder": 10,
+                "displayable": True
+            },
+            "endConditionValue": reps_num,
             "targetType": {
                 "workoutTargetTypeId": 1,
-                "workoutTargetTypeKey": "no.target"
+                "workoutTargetTypeKey": "no.target",
+                "displayOrder": 1
             },
-            "numberOfIterations": series,
-            "endCondition": {
-                "conditionTypeId": 3,
-                "conditionTypeKey": "reps.condition",
-                "conditionValue": reps
-            },
-            "endConditionValue": None,
-            "preferredEndConditionUnit": None
-        })
+            "description": desc
+        }
+        step_order += 1
 
-        # Paso de descanso (si hay)
-        if descanso > 0 and i < len(entrenamiento.get("ejercicios", [])) - 1:
-            steps.append({
+        repeat_steps = [exercise_step]
+
+        # Step de descanso (si hay)
+        if descanso > 0:
+            recovery_step = {
                 "type": "ExecutableStepDTO",
-                "stepOrder": len(steps) + 1,
+                "stepOrder": step_order,
                 "stepType": {
                     "stepTypeId": 4,
-                    "stepTypeKey": "recovery"
+                    "stepTypeKey": "recovery",
+                    "displayOrder": 4
                 },
-                "childStepId": None,
-                "description": f"Descanso {descanso}s",
                 "endCondition": {
                     "conditionTypeId": 2,
-                    "conditionTypeKey": "time.condition",
-                    "conditionValue": descanso
+                    "conditionTypeKey": "time",
+                    "displayOrder": 2,
+                    "displayable": True
                 },
                 "endConditionValue": descanso,
                 "targetType": {
                     "workoutTargetTypeId": 1,
-                    "workoutTargetTypeKey": "no.target"
+                    "workoutTargetTypeKey": "no.target",
+                    "displayOrder": 1
                 }
-            })
+            }
+            repeat_steps.append(recovery_step)
+            step_order += 1
+
+        # Repeat group: las series del ejercicio
+        repeat_group = {
+            "type": "RepeatGroupDTO",
+            "stepOrder": step_order,
+            "stepType": {
+                "stepTypeId": 6,
+                "stepTypeKey": "repeat",
+                "displayOrder": 6
+            },
+            "numberOfIterations": series,
+            "workoutSteps": repeat_steps,
+            "endCondition": {
+                "conditionTypeId": 7,
+                "conditionTypeKey": "iterations",
+                "displayOrder": 7,
+                "displayable": False
+            },
+            "endConditionValue": float(series),
+            "smartRepeat": False
+        }
+        steps.append(repeat_group)
+        step_order += 1
+
+    duracion_estimada = sum(
+        int(ej.get("series", 3)) * (int(ej.get("descanso", 60)) + 5)
+        for ej in ejercicios
+    ) or 600
 
     return {
         "workoutName": entrenamiento.get("nombre", "Entrenamiento"),
-        "description": entrenamiento.get("descripcion", ""),
+        "description": entrenamiento.get("descripcion") or None,
         "sportType": {
             "sportTypeId": 5,
-            "sportTypeKey": "strength_training"
+            "sportTypeKey": "strength_training",
+            "displayOrder": 1
         },
+        "estimatedDurationInSecs": duracion_estimada,
+        "author": {},
         "workoutSegments": [
             {
                 "segmentOrder": 1,
                 "sportType": {
                     "sportTypeId": 5,
-                    "sportTypeKey": "strength_training"
+                    "sportTypeKey": "strength_training",
+                    "displayOrder": 1
                 },
                 "workoutSteps": steps
             }
         ]
     }
-
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
