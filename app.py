@@ -61,11 +61,11 @@ def get_client(alumno_id: str, email: str = None, password: str = None) -> Garmi
     Si hay tokens guardados los usa; si no, hace login con credenciales.
     """
     path = token_path(alumno_id)
-    client = Garmin(email=email, password=password)
 
     if os.path.exists(path):
         try:
-            client.login(path)
+            client = Garmin()
+            client.client.load(path)
             logger.info("Tokens cargados para alumno %s", alumno_id)
             return client
         except Exception as e:
@@ -75,8 +75,9 @@ def get_client(alumno_id: str, email: str = None, password: str = None) -> Garmi
     if not email or not password:
         raise ValueError("Se requieren credenciales para el primer login")
 
+    client = Garmin(email=email, password=password)
     client.login()
-    client.garth.dump(path)
+    client.client.dump(path)
     logger.info("Login exitoso y tokens guardados para alumno %s", alumno_id)
     return client
 
@@ -229,7 +230,7 @@ def auth():
             client = Garmin(email=email, password=password)
 
         client.login()
-        client.garth.dump(path)
+        client.client.dump(path)
 
         return jsonify({
             "ok": True,
@@ -337,8 +338,12 @@ def disconnect():
         return jsonify({"error": "Falta alumno_id"}), 400
 
     path = token_path(alumno_id)
-    if os.path.exists(path):
-        import shutil
+    import shutil
+    # El path puede ser directorio o archivo .json
+    token_file = path if path.endswith('.json') else os.path.join(path, 'garmin_tokens.json')
+    if os.path.exists(token_file):
+        os.remove(token_file)
+    elif os.path.exists(path):
         shutil.rmtree(path, ignore_errors=True)
 
     return jsonify({"ok": True, "mensaje": "Garmin desconectado"})
